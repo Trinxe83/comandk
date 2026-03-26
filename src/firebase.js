@@ -2,22 +2,21 @@
 import { initializeApp } from "firebase/app";
 import { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut } from "firebase/auth";
 
-// TODO: REEMPLAZA ESTE OBJETO CON LA CONFIGURACIÓN DE TU PROYECTO FIREBASE
-// Lo encontrarás en la Consola de Firebase -> Configuración del Proyecto -> General
+// Configuración cargada desde variables de entorno (.env)
 const firebaseConfig = {
-  apiKey: "AIzaSyDmPfpa7wXYeBgFDhNRgdSsxZnTtayLGgw",
-  authDomain: "comandk.firebaseapp.com",
-  projectId: "comandk",
-  storageBucket: "comandk.firebasestorage.app",
-  messagingSenderId: "401974005061",
-  appId: "1:401974005061:web:449aa0b14ed51e0a12422c",
-  measurementId: "G-BE0FZXFWHC"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
 
 let app, auth, provider;
 
 // Inicializamos Firebase solo si has pegado tu configuración
-if (firebaseConfig.apiKey) {
+if (import.meta.env.VITE_FIREBASE_API_KEY) {
   app = initializeApp(firebaseConfig);
   auth = getAuth(app);
   provider = new GoogleAuthProvider();
