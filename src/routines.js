@@ -177,6 +177,15 @@ export const RUTINAS = {
   },
 };
 
+// ── Secuencias de rotación por nivel ─────────────────────────────────────────
+// Cada nivel tiene sus rutinas en orden de rotación.
+// Una vez completadas todas, se reinicia desde el principio.
+export const ROTACION = {
+  beginner:     ['alfa-fuerza', 'alfa-hipertrofia', 'alfa-resistencia', 'alfa-perdida'],
+  intermediate: ['bravo-fuerza', 'bravo-hipertrofia', 'bravo-resistencia', 'bravo-perdida'],
+  elite:        ['charlie-fuerza', 'charlie-hipertrofia', 'charlie-resistencia'],
+};
+
 export function getKeyForProfile(nivel, objetivo) {
   const n = nivel === 'elite' ? 'charlie' : nivel === 'intermediate' ? 'bravo' : 'alfa';
   const o = objetivo || 'fuerza';
@@ -184,6 +193,35 @@ export function getKeyForProfile(nivel, objetivo) {
   if (n === 'charlie' && o === 'perdida') return 'charlie-fuerza';
   const key = `${n}-${o}`;
   return RUTINAS[key] ? key : `${n}-fuerza`;
+}
+
+/**
+ * Devuelve la rutina que toca según el índice de rotación del nivel del usuario.
+ * Si el nivel no está definido, usa el objetivo original como fallback.
+ * @param {Object} perfil
+ * @param {Object} rotationMap  - { beginner: 0, intermediate: 2, elite: 1 }
+ */
+export function getRutinaDelDia(perfil, rotationMap = {}) {
+  const nivel = perfil.level;
+  const secuencia = ROTACION[nivel];
+
+  if (!secuencia) {
+    // Fallback: sin nivel asignado todavía
+    return getKeyForProfile(nivel, perfil.objetivo);
+  }
+
+  const idx = (rotationMap[nivel] || 0) % secuencia.length;
+  return RUTINAS[secuencia[idx]];
+}
+
+/**
+ * Avanza el índice de rotación para el nivel del usuario y devuelve el nuevo mapa.
+ */
+export function avanzarRotacion(nivel, rotationMap = {}) {
+  const secuencia = ROTACION[nivel];
+  if (!secuencia) return rotationMap;
+  const current = rotationMap[nivel] || 0;
+  return { ...rotationMap, [nivel]: (current + 1) % secuencia.length };
 }
 
 export function generarRutina(perfil) {

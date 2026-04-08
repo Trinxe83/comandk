@@ -1,6 +1,8 @@
 import './style.css'
 import { translations } from './i18n.js'
 import { auth, provider, signInWithPopup, onAuthStateChanged, signOut } from './firebase.js'
+import { saveSession, loadSessions, saveRotationMap, loadRotationMap } from './db.js'
+import { getRutinaDelDia, avanzarRotacion, ROTACION } from './routines.js'
 
 // ── Algoritmo de rutinas según perfil ──────────────────────────────────────
 function generarRutina(perfil) {
@@ -184,6 +186,7 @@ function calcularMacros(perfil) {
 const app = {
   activeNav: 'dashboard',
   currentLang: 'es',
+  rotationMap: {},
   userProfile: {
     level: null,
     completedAssessment: false,
@@ -209,9 +212,10 @@ const app = {
     this.updateStaticTranslations();
 
     if (auth) {
-      onAuthStateChanged(auth, (user) => {
+      onAuthStateChanged(auth, async (user) => {
         if (user) {
           this.userProfile.nombre = user.displayName;
+          this._uid = user.uid;
           const key = `assessment_done_${user.uid}`;
           const saved = localStorage.getItem(key);
           if (saved) {
@@ -219,6 +223,13 @@ const app = {
             this.userProfile.completedAssessment = true;
           }
           this.userProfile.assessmentKey = key;
+          // Cargar historial y rotación desde Firestore
+          const [sessions, rotation] = await Promise.all([
+            loadSessions(user.uid),
+            loadRotationMap(user.uid),
+          ]);
+          this.userProfile.sessionLog = sessions;
+          this.rotationMap = rotation;
           this.showAppShell();
         } else {
           this.showAuthView();
@@ -253,8 +264,16 @@ const app = {
       catch (e) { this.authErrorMsg.innerText = 'Error: ' + e.message; this.authErrorMsg.style.display = 'block'; }
     });
 
-    this.btnLoginDemo.addEventListener('click', () => {
+    this.btnLoginDemo.addEventListener('click', async () => {
       this.userProfile.nombre = 'INVITADO';
+      this._uid = null;
+      // Cargar desde localStorage en modo demo
+      const [sessions, rotation] = await Promise.all([
+        loadSessions(null),
+        loadRotationMap(null),
+      ]);
+      this.userProfile.sessionLog = sessions;
+      this.rotationMap = rotation;
       this.showAppShell();
     });
 
@@ -450,9 +469,14 @@ const app = {
 
   // ── HUD ─────────────────────────────────────────────────────────────────
   renderDashboard() {
-    const rutina = generarRutina(this.userProfile);
+    const rutina = this.userProfile.level
+      ? getRutinaDelDia(this.userProfile, this.rotationMap)
+      : generarRutina(this.userProfile);
     const macros = calcularMacros(this.userProfile);
     const nivel = { beginner: 'RUTA ALFA', intermediate: 'RUTA BRAVO', elite: 'RUTA CHARLIE' }[this.userProfile.level] || '—';
+    const secuencia = ROTACION[this.userProfile.level] || [];
+    const rotIdx = (this.rotationMap[this.userProfile.level] || 0) % (secuencia.length || 1);
+    const progCirculo = secuencia.length > 0 ? Math.round((rotIdx / secuencia.length) * 100) : 0;
 
     this.container.innerHTML = `
       <section style="animation:fadeIn 0.5s ease-out;">
@@ -703,11 +727,25 @@ const app = {
     });
 
     document.querySelector('#btn-back').onclick = () => { clearInterval(timerInterval); this.activeNav = 'workouts'; this.render(); };
-    document.querySelector('#finish-exercise-btn').onclick = () => {
+    document.querySelector('#finish-exercise-btn').onclick = async () => {
       clearInterval(timerInterval);
       const reps = [...document.querySelectorAll('.reps-input')].map(i => parseInt(i.value) || 0);
       const totalReps = reps.reduce((a, b) => a + b, 0);
-      this.userProfile.sessionLog.push({ ejercicio: ej.nombre, fecha: new Date().toLocaleDateString('es-ES'), reps, totalReps });
+      const rutina = getRutinaDelDia(this.userProfile, this.rotationMap) || {};
+      const sessionData = {
+        ejercicio: ej.nombre,
+        rutinaId: rutina.id || 'unknown',
+        rutinaNombre: rutina.nombre || ej.nombre,
+        fecha: new Date().toLocaleDateString('es-ES'),
+        reps,
+        totalReps,
+      };
+      // Guardar sesión en Firestore / localStorage
+      await saveSession(this._uid || null, sessionData);
+      this.userProfile.sessionLog.push(sessionData);
+      // Avanzar rotación y persistir
+      this.rotationMap = avanzarRotacion(this.userProfile.level, this.rotationMap);
+      await saveRotationMap(this._uid || null, this.rotationMap);
       this.activeNav = 'success';
       this.render();
     };
@@ -849,52 +887,101 @@ const app = {
   // ── INTEL (PROGRESO) ─────────────────────────────────────────────────────
   renderProgress() {
     const log = this.userProfile.sessionLog;
-    const logHTML = log.length === 0
-      ? '<p style="opacity:0.5; text-align:center; padding:2rem 0;">Aún no hay sesiones registradas. ¡Completa tu primer entrenamiento!</p>'
-      : [...log].reverse().map(s => `
-          <div class="card glass" style="padding:1rem; margin-bottom:0.8rem; display:flex; justify-content:space-between; align-items:center;">
-            <div>
-              <div style="font-size:0.9rem; font-weight:700; color:var(--primary-color); margin-bottom:0.2rem;">${s.ejercicio}</div>
-              <div class="label-sm" style="font-size:0.6rem;">${s.fecha}</div>
-            </div>
-            <div style="text-align:right;">
-              <div class="stat-number" style="font-size:1.4rem;">${s.totalReps}</div>
-              <div class="label-sm" style="font-size:0.55rem;">REPS TOTALES</div>
-            </div>
-          </div>`).join('');
-
     const totalSesiones = log.length;
     const totalReps = log.reduce((acc, s) => acc + s.totalReps, 0);
     const maxReps = log.reduce((max, s) => Math.max(max, s.totalReps), 0);
 
+    // ── Racha de días consecutivos ──────────────────────────────────────────
+    const fechasUnicas = [...new Set(log.map(s => s.fecha))].reverse();
+    let racha = 0;
+    const hoy = new Date();
+    for (let i = 0; i < fechasUnicas.length; i++) {
+      const d = new Date(fechasUnicas[i].split('/').reverse().join('-'));
+      const diffDias = Math.round((hoy - d) / 86400000);
+      if (diffDias === i || diffDias === i + 1) racha++;
+      else break;
+    }
+
+    // ── Gráfica de barras SVG — sesiones por semana (últimas 6 semanas) ──────
+    const porSemana = {};
+    log.forEach(s => {
+      const parts = s.fecha.split('/');
+      if (parts.length !== 3) return;
+      const d = new Date(`${parts[2]}-${parts[1].padStart(2,'0')}-${parts[0].padStart(2,'0')}`);
+      const startOfWeek = new Date(d);
+      startOfWeek.setDate(d.getDate() - d.getDay());
+      const key = startOfWeek.toISOString().slice(0, 10);
+      porSemana[key] = (porSemana[key] || 0) + 1;
+    });
+    const semanas = Object.keys(porSemana).sort().slice(-6);
+    const maxSemana = Math.max(...semanas.map(k => porSemana[k]), 1);
+    const barW = 32, barGap = 10, chartH = 80;
+    const svgW = semanas.length * (barW + barGap);
+    const barsHTML = semanas.map((k, i) => {
+      const val = porSemana[k];
+      const barH = Math.round((val / maxSemana) * chartH);
+      const x = i * (barW + barGap);
+      const fechaCorta = k.slice(5); // MM-DD
+      return `
+        <rect x="${x}" y="${chartH - barH}" width="${barW}" height="${barH}" fill="var(--primary-color)" opacity="0.85" rx="2"/>
+        <text x="${x + barW/2}" y="${chartH + 14}" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.4)">${fechaCorta}</text>
+        <text x="${x + barW/2}" y="${chartH - barH - 4}" text-anchor="middle" font-size="9" fill="var(--primary-color)">${val}</text>`;
+    }).join('');
+
+    const chartHTML = semanas.length > 0 ? `
+      <div class="card glass" style="margin-bottom:1.2rem; padding:1.2rem;">
+        <div class="label-sm" style="font-size:0.55rem; margin-bottom:1rem;">📊 SESIONES POR SEMANA</div>
+        <svg width="100%" viewBox="0 0 ${Math.max(svgW, 100)} ${chartH + 20}" style="overflow:visible;">
+          ${barsHTML}
+        </svg>
+      </div>` : '';
+
+    // ── Historial de sesiones ──────────────────────────────────────────────
+    const logHTML = log.length === 0
+      ? '<p style="opacity:0.5; text-align:center; padding:2rem 0;">Aún no hay sesiones registradas. ¡Completa tu primer entrenamiento!</p>'
+      : [...log].reverse().slice(0, 20).map(s => `
+          <div class="card glass" style="padding:0.9rem 1rem; margin-bottom:0.6rem; display:flex; justify-content:space-between; align-items:center;">
+            <div>
+              <div style="font-size:0.85rem; font-weight:700; color:var(--primary-color); margin-bottom:0.1rem;">${s.rutinaNombre || s.ejercicio}</div>
+              <div class="label-sm" style="font-size:0.6rem; opacity:0.6;">${s.ejercicio} · ${s.fecha}</div>
+            </div>
+            <div style="text-align:right;">
+              <div class="stat-number" style="font-size:1.4rem;">${s.totalReps}</div>
+              <div class="label-sm" style="font-size:0.5rem;">REPS</div>
+            </div>
+          </div>`).join('');
+
     this.container.innerHTML = `
       <section style="animation:fadeIn 0.5s ease-out;">
         <h1 class="glow-text" style="margin-bottom:0.3rem;">${this.t('intel')}</h1>
-        <p class="label-sm" style="margin-bottom:1.5rem; opacity:0.6;">REGISTRO OPERATIVO DE PROGRESIÓN</p>
+        <p class="label-sm" style="margin-bottom:1.2rem; opacity:0.6;">REGISTRO OPERATIVO DE PROGRESIÓN</p>
 
-        <div class="stats-grid" style="margin-bottom:1.5rem;">
+        <div class="stats-grid" style="margin-bottom:1.2rem;">
           <div class="card glass" style="padding:1rem; border-left:3px solid var(--primary-color);">
-            <div class="label-sm" style="font-size:0.55rem;">SESIONES TOTALES</div>
+            <div class="label-sm" style="font-size:0.55rem;">SESIONES</div>
             <div class="stat-number" style="font-size:2rem;">${totalSesiones}</div>
           </div>
-          <div class="card glass" style="padding:1rem; border-left:3px solid var(--secondary-color);">
-            <div class="label-sm" style="font-size:0.55rem;">REPS ACUMULADAS</div>
-            <div class="stat-number" style="font-size:2rem;">${totalReps}</div>
+          <div class="card glass" style="padding:1rem; border-left:3px solid #00f5c8;">
+            <div class="label-sm" style="font-size:0.55rem;">RACHA 🔥</div>
+            <div class="stat-number" style="font-size:2rem;">${racha}<span style="font-size:0.8rem;opacity:0.5;"> días</span></div>
           </div>
           <div class="card glass" style="padding:1rem; border-left:3px solid var(--primary-color);">
+            <div class="label-sm" style="font-size:0.55rem;">REPS TOTAL</div>
+            <div class="stat-number" style="font-size:2rem;">${totalReps}</div>
+          </div>
+          <div class="card glass" style="padding:1rem; border-left:3px solid #00f5c8;">
             <div class="label-sm" style="font-size:0.55rem;">MEJOR SESIÓN</div>
             <div class="stat-number" style="font-size:2rem;">${maxReps}</div>
           </div>
-          <div class="card glass" style="padding:1rem; border-left:3px solid var(--secondary-color);">
-            <div class="label-sm" style="font-size:0.55rem;">KCAL QUEMADAS ~</div>
-            <div class="stat-number" style="font-size:2rem;">${Math.round(totalReps * 0.5)}</div>
-          </div>
         </div>
 
-        <div class="label-sm" style="margin-bottom:1rem;">HISTORIAL DE SESIONES</div>
+        ${chartHTML}
+
+        <div class="label-sm" style="margin-bottom:0.8rem;">HISTORIAL DE SESIONES</div>
         ${logHTML}
       </section>`;
   }
 };
 
 app.init();
+
